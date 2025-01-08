@@ -80,24 +80,54 @@ zzz,yyy,xxx
     }
 
     #[tokio::test]
-    async fn test_delimiter() {
+    async fn test_semicolon() {
         let data = "a;b;c\n";
-        let mut rd = Reader::new(data.as_bytes()).await.unwrap().with_delimiter(b';');
+        let mut rd = Reader::new(data.as_bytes())
+            .await
+            .unwrap()
+            .with_delimiter(b';');
         let records = rd.records().await.unwrap();
         assert_eq!(to_string_records(records), vec![vec!["a", "b", "c"]]);
     }
-   
+
     #[tokio::test]
     async fn test_multiline() {
         let data = r#""two
-line",
-"one line",
-"three
+line","one line","three
 line
 field""#;
-println!("{}", data);
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
         let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec!["two\nline", "one line", "three\nline\nfield"]]);
+        assert_eq!(to_string_records(records), vec![vec![
+            "two\nline",
+            "one line",
+            "three\nline\nfield"
+        ]]);
+    }
+
+    #[tokio::test]
+    async fn test_blank_line() {
+        let data = "a,b,c\n\nd,e,f\n\n";
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c"], vec![
+            "d", "e", "f"
+        ]]);
+    }
+
+    #[tokio::test]
+    async fn test_space() {
+        let data = "a,  b,    c";
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["a", "  b", "    c"]]);
+    }
+
+    #[tokio::test]
+    async fn test_double_quote() {
+        let data = r#"a""b,c"#;
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec![r#"a""b"#, "c"]]);
     }
 }

@@ -1,8 +1,10 @@
+use std::str::from_utf8;
+
 use anyhow::{Error, Result};
 use memchr::memchr;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
-const DELIMITER_LEN: usize = 1;
+const COMMA_LEN: usize = 1;
 const QUOTE_LEN: usize = 1;
 
 #[derive(Clone)]
@@ -13,26 +15,28 @@ struct Position {
 
 pub struct Reader<R: AsyncRead + std::marker::Unpin> {
     r: BufReader<R>,
-    delimiter: u8,
+    comma: u8,
     num_line: usize,
     offset: usize,
     field_per_record: usize,
+    hit_eof: bool,
 }
 
 impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
     pub async fn new(r: R) -> Result<Self> {
         Ok(Self {
             r: BufReader::new(r),
-            delimiter: b',',
+            comma: b',',
             num_line: 0,
             offset: 0,
             field_per_record: 0,
+            hit_eof: false,
         })
     }
 
-    pub fn with_delimiter(mut self, delimiter: u8) -> Self {
+    pub fn with_delimiter(mut self, comma: u8) -> Self {
         // TODO: check invalid delimiter
-        self.delimiter = delimiter;
+        self.comma = comma;
         self
     }
 
@@ -41,6 +45,9 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         let mut record_buf = Vec::new();
         loop {
             let record = self.read_record(&mut record_buf).await;
+            if self.hit_eof {
+                break;
+            }
             match record {
                 Ok(record) => {
                     records.push(record.iter().map(|f| f.to_vec()).collect());
@@ -62,15 +69,20 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         let mut field_index = Vec::new();
         let mut field_position = Vec::new();
         let mut line_vec = self.read_line().await?;
+        // skip empty line
+        while !self.hit_eof && line_vec.len() == length_nl(&line_vec) {
+            println!("{:?}", line_vec);
+            line_vec = self.read_line().await?;
+        }
         let mut line = line_vec.as_slice();
         let mut pos = Position {
             line: self.num_line,
-            col: 0,
+            col: 1,
         };
         'PARSE_FIELD: loop {
             if line.len() == 0 || line[0] != b'"' {
                 // No quote field
-                let i = memchr(self.delimiter, &line);
+                let i = memchr(self.comma, &line);
                 let field = match i {
                     None => &line[0..line.len() - length_nl(&line)],
                     Some(i) => &line[0..i],
@@ -79,8 +91,8 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                 field_index.push(record_buf.len());
                 field_position.push(pos.clone());
                 if let Some(i) = i {
-                    line = &line[i + DELIMITER_LEN..];
-                    pos.col += i + DELIMITER_LEN;
+                    line = &line[i + COMMA_LEN..];
+                    pos.col += i + COMMA_LEN;
                     continue 'PARSE_FIELD;
                 }
                 break 'PARSE_FIELD;
@@ -100,14 +112,14 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                             record_buf.extend_from_slice(&line[0..i]);
                             line = &line[i + QUOTE_LEN..];
                             pos.col += i + QUOTE_LEN;
-                            let ch = line[0];
+                            let ch = if line.len() > 0 { line[0] } else { b'\0' };
                             if ch == b'"' {
                                 record_buf.push(b'"');
                                 line = &line[QUOTE_LEN..];
                                 pos.col += QUOTE_LEN;
-                            } else if ch == self.delimiter {
-                                line = &line[DELIMITER_LEN..];
-                                pos.col += DELIMITER_LEN;
+                            } else if ch == self.comma {
+                                line = &line[COMMA_LEN..];
+                                pos.col += COMMA_LEN;
                                 field_index.push(record_buf.len());
                                 field_position.push(field_pos.clone());
                                 continue 'PARSE_FIELD;
@@ -116,7 +128,7 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                                 field_position.push(field_pos.clone());
                                 break 'PARSE_FIELD;
                             } else {
-                                return Err(anyhow::anyhow!("unexpected character"));
+                                return Err(anyhow::anyhow!("unexpected character {}", ch));
                             }
                         }
                         None => {
@@ -127,6 +139,10 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                                     pos.col += line.len();
                                     line_vec = self.read_line().await?;
                                     line = line_vec.as_slice();
+                                    if line.len() > 0 {
+                                        pos.line += 1;
+                                        pos.col = 1;
+                                    }
                                 }
                                 false => {
                                     // Abrupt end of file (EOF or error)
@@ -143,11 +159,14 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
 
         if self.field_per_record == 0 {
             self.field_per_record = field_index.len();
-        } else if self.field_per_record != field_index.len() {
-            return Err(anyhow::anyhow!("wrong number of fields"));
+        } else if self.field_per_record != field_index.len() && !self.hit_eof {
+            return Err(anyhow::anyhow!(
+                "wrong number of fields expect:{} got:{}",
+                self.field_per_record,
+                field_index.len()
+            ));
         }
 
-        // println!("{:?} {:?}", record_buf, field_index);
         let mut ret = Vec::new();
         let mut pre_idx = 0;
         for idx in field_index {
@@ -160,7 +179,7 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
 
     async fn read_line(&mut self) -> Result<Vec<u8>> {
         let mut line = Vec::new();
-        let res = self.read_slice(b'\n', &mut line).await;
+        let res = self.read_slice(&mut line).await;
         match res {
             Err(e) => {
                 if is_eof(&e) {
@@ -183,11 +202,14 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         Ok(line)
     }
 
-    async fn read_slice(&mut self, delimiter: u8, buf: &mut Vec<u8>) -> Result<usize> {
-        let n = self.r.read_until(delimiter, buf).await;
+    async fn read_slice(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
+        let n = self.r.read_until(b'\n', buf).await;
         match n {
             Err(e) => Err(e.into()),
-            Ok(0) => Err(anyhow::anyhow!("EOF")),
+            Ok(0) => {
+                self.hit_eof = true;
+                Err(anyhow::anyhow!("EOF"))
+            }
             Ok(n) => Ok(n),
         }
     }
