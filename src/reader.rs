@@ -1,11 +1,43 @@
-use std::str::from_utf8;
-
 use anyhow::{Error, Result};
 use memchr::memchr;
+use std::fmt::{Debug, Display};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 const COMMA_LEN: usize = 1;
 const QUOTE_LEN: usize = 1;
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    ErrInvalidDelim,
+    ErrEOF,
+    ErrQuote(usize, usize),
+    ErrChar(usize, usize, u8),
+    ErrFieldNum(usize, usize, usize, usize),
+}
+
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorKind::ErrInvalidDelim => write!(f, "Invalid Delimiter"),
+            ErrorKind::ErrEOF => write!(f, "EOF"),
+            ErrorKind::ErrQuote(line, col) => {
+                write!(f, "line:{} col:{} Error Quote", line, col)
+            }
+            ErrorKind::ErrChar(line, col, ch) => {
+                write!(f, "line:{} col:{} Unexpected Character {}", line, col, ch)
+            }
+            ErrorKind::ErrFieldNum(line, col, expect, got) => {
+                write!(
+                    f,
+                    "line:{} col:{} Wrong Number Of Fields, Expect:{} Got:{}",
+                    line, col, expect, got
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ErrorKind {}
 
 #[derive(Clone)]
 struct Position {
@@ -16,10 +48,14 @@ struct Position {
 pub struct Reader<R: AsyncRead + std::marker::Unpin> {
     r: BufReader<R>,
     comma: u8,
+    allow_diff_field_num: bool,
+    has_header: bool,
+    lazy_quote: bool,
+
     num_line: usize,
     offset: usize,
     field_per_record: usize,
-    hit_eof: bool,
+    remain_header: bool,
 }
 
 impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
@@ -27,17 +63,42 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         Ok(Self {
             r: BufReader::new(r),
             comma: b',',
+            allow_diff_field_num: false,
+            has_header: false,
+            lazy_quote: false,
+
             num_line: 0,
             offset: 0,
             field_per_record: 0,
-            hit_eof: false,
+            remain_header: false,
         })
     }
 
-    pub fn with_delimiter(mut self, comma: u8) -> Self {
+    pub fn with_delimiter(mut self, comma: u8) -> Result<Self> {
         // TODO: check invalid delimiter
-        self.comma = comma;
-        self
+        match comma {
+            b'\n' | b'\r' | b'"' => Err(ErrorKind::ErrInvalidDelim.into()),
+            _ => {
+                self.comma = comma;
+                Ok(self)
+            }
+        }
+    }
+
+    pub fn with_allow_diff_field_num(mut self, allow_diff_field_num: bool) -> Result<Self> {
+        self.allow_diff_field_num = allow_diff_field_num;
+        Ok(self)
+    }
+
+    pub fn with_has_header(mut self, has_header: bool) -> Result<Self> {
+        self.has_header = has_header;
+        self.remain_header = has_header;
+        Ok(self)
+    }
+
+    pub fn with_lazy_quote(mut self, lazy_quote: bool) -> Result<Self> {
+        self.lazy_quote = lazy_quote;
+        Ok(self)
     }
 
     pub async fn records(&mut self) -> Result<Vec<Vec<Vec<u8>>>> {
@@ -45,11 +106,12 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         let mut record_buf = Vec::new();
         loop {
             let record = self.read_record(&mut record_buf).await;
-            if self.hit_eof {
-                break;
-            }
             match record {
                 Ok(record) => {
+                    if self.remain_header {
+                        self.remain_header = false;
+                        continue;
+                    }
                     records.push(record.iter().map(|f| f.to_vec()).collect());
                 }
                 Err(e) => {
@@ -68,12 +130,24 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         record_buf.clear();
         let mut field_index = Vec::new();
         let mut field_position = Vec::new();
-        let mut line_vec = self.read_line().await?;
+        let mut line_vec = Vec::new();
+        let mut err = None;
         // skip empty line
-        while !self.hit_eof && line_vec.len() == length_nl(&line_vec) {
-            println!("{:?}", line_vec);
-            line_vec = self.read_line().await?;
+        while err.is_none() {
+            let res = self.read_line(&mut line_vec).await;
+            err = res.err();
+            if err.is_none() && line_vec.len() == length_nl(&line_vec) {
+                line_vec.clear();
+                continue;
+            }
+            break;
         }
+        if let Some(e) = err {
+            if is_eof(&e) {
+                return Err(e);
+            }
+        }
+
         let mut line = line_vec.as_slice();
         let mut pos = Position {
             line: self.num_line,
@@ -87,6 +161,13 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                     None => &line[0..line.len() - length_nl(&line)],
                     Some(i) => &line[0..i],
                 };
+                // Check to make sure a quote does not appear in field.
+                if !self.lazy_quote {
+                    if let Some(j) = memchr(b'"', field) {
+                        let col = pos.col + j;
+                        return Err(ErrorKind::ErrQuote(self.num_line, col).into());
+                    }
+                }
                 record_buf.extend_from_slice(field);
                 field_index.push(record_buf.len());
                 field_position.push(pos.clone());
@@ -106,65 +187,77 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                 pos.col += QUOTE_LEN;
                 loop {
                     let i = memchr(b'"', &line); //next quote
-                    match i {
-                        Some(i) => {
-                            // Hit next quote
-                            record_buf.extend_from_slice(&line[0..i]);
-                            line = &line[i + QUOTE_LEN..];
-                            pos.col += i + QUOTE_LEN;
-                            let ch = if line.len() > 0 { line[0] } else { b'\0' };
-                            if ch == b'"' {
-                                record_buf.push(b'"');
-                                line = &line[QUOTE_LEN..];
-                                pos.col += QUOTE_LEN;
-                            } else if ch == self.comma {
-                                line = &line[COMMA_LEN..];
-                                pos.col += COMMA_LEN;
-                                field_index.push(record_buf.len());
-                                field_position.push(field_pos.clone());
-                                continue 'PARSE_FIELD;
-                            } else if length_nl(line) == line.len() {
-                                field_index.push(record_buf.len());
-                                field_position.push(field_pos.clone());
-                                break 'PARSE_FIELD;
-                            } else {
-                                return Err(anyhow::anyhow!("unexpected character {}", ch));
-                            }
+                    if let Some(i) = i {
+                        // Hit next quote
+                        record_buf.extend_from_slice(&line[0..i]);
+                        line = &line[i + QUOTE_LEN..];
+                        pos.col += i + QUOTE_LEN;
+                        let ch = if line.len() > 0 { line[0] } else { b'\0' };
+                        if ch == b'"' {
+                            // `""` sequence (append quote)
+                            record_buf.push(b'"');
+                            line = &line[QUOTE_LEN..];
+                            pos.col += QUOTE_LEN;
+                        } else if ch == self.comma {
+                            // `",` sequence (end of field)
+                            line = &line[COMMA_LEN..];
+                            pos.col += COMMA_LEN;
+                            field_index.push(record_buf.len());
+                            field_position.push(field_pos.clone());
+                            continue 'PARSE_FIELD;
+                        } else if length_nl(line) == line.len() {
+                            // `"\n` sequence (end of line)
+                            field_index.push(record_buf.len());
+                            field_position.push(field_pos.clone());
+                            break 'PARSE_FIELD;
+                        } else if self.lazy_quote {
+                            // `"` sequence (bare quote)
+                            record_buf.push(b'"');
+                        } else {
+                            // `"*` sequence (invalid non-escaped quote)
+                            return Err(
+                                ErrorKind::ErrQuote(self.num_line, pos.col - QUOTE_LEN).into()
+                            );
                         }
-                        None => {
-                            match line.len() > 0 {
-                                true => {
-                                    // Hit end of line
-                                    record_buf.extend_from_slice(line);
-                                    pos.col += line.len();
-                                    line_vec = self.read_line().await?;
-                                    line = line_vec.as_slice();
-                                    if line.len() > 0 {
-                                        pos.line += 1;
-                                        pos.col = 1;
-                                    }
-                                }
-                                false => {
-                                    // Abrupt end of file (EOF or error)
-                                    field_index.push(record_buf.len());
-                                    field_position.push(field_pos.clone());
-                                    break 'PARSE_FIELD;
-                                }
+                    } else if line.len() > 0 {
+                        // Hit end of line
+                        record_buf.extend_from_slice(line);
+                        pos.col += line.len();
+                        line_vec.clear();
+                        if let Err(e) = self.read_line(&mut line_vec).await {
+                            if !is_eof(&e) {
+                                return Err(e);
                             }
+                        };
+                        line = line_vec.as_slice();
+                        if line.len() > 0 {
+                            pos.line += 1;
+                            pos.col = 1;
                         }
+                    } else {
+                        if !self.lazy_quote {
+                            return Err(ErrorKind::ErrQuote(self.num_line, pos.col).into());
+                        }
+                        field_index.push(record_buf.len());
+                        field_position.push(field_pos);
+                        break 'PARSE_FIELD;
                     }
                 }
             }
         }
 
-        if self.field_per_record == 0 {
+        if self.allow_diff_field_num {
+            // do nothing
+        } else if self.field_per_record == 0 {
             self.field_per_record = field_index.len();
-        } else if self.field_per_record != field_index.len() && !self.hit_eof {
-            return Err(anyhow::anyhow!(
-                "wrong number of fields expect:{} got:{}",
+        } else if self.field_per_record != field_index.len() {
+            return Err(ErrorKind::ErrFieldNum(
+                self.num_line,
+                pos.col,
                 self.field_per_record,
-                field_index.len()
-            ));
+                field_index.len(),
+            )
+            .into());
         }
 
         let mut ret = Vec::new();
@@ -177,63 +270,44 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         Ok(ret)
     }
 
-    async fn read_line(&mut self) -> Result<Vec<u8>> {
-        let mut line = Vec::new();
-        let res = self.read_slice(&mut line).await;
-        match res {
-            Err(e) => {
-                if is_eof(&e) {
-                    if line.len() > 0 && line.last().unwrap() == &b'\r' {
-                        line.pop();
-                    }
-                } else {
-                    return Err(e);
+    async fn read_line(&mut self) -> Result<()> {
+        let (mut line, mut err) = self.read_slice().await;
+        let n = line.len();
+        if let Some(e) = err {
+            if n > 0 && is_eof(&e) {
+                err = None;
+                if line[n - 1] == b'\r' {
+                    line = line[..n - 1].to_vec();
                 }
             }
-            Ok(_) => {}
-        };
-        let n = line.len();
+        }
         self.num_line += 1;
         self.offset += n;
         if n >= 2 && line[n - 2] == b'\r' && line[n - 1] == b'\n' {
             line[n - 2] = b'\n';
             line.truncate(n - 1);
         }
-        Ok(line)
+        Ok(())
     }
 
-    async fn read_slice(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
-        let n = self.r.read_until(b'\n', buf).await;
-        match n {
-            Err(e) => Err(e.into()),
-            Ok(0) => {
-                self.hit_eof = true;
-                Err(anyhow::anyhow!("EOF"))
-            }
-            Ok(n) => Ok(n),
+    async fn read_slice(&mut self) -> (Vec<u8>, Option<Error>) {
+        let mut buf = Vec::new();
+        loop {
+            let n = self.r.read_until(b'\n', &mut buf).await;
+            match n {
+                Err(e) => return (buf, Some(e.into())),
+                Ok(0) => {
+                    return (buf, Some(ErrorKind::ErrEOF.into()));
+                }
+                Ok(_) => {
+                    if buf.last().unwrap() == &b'\n' {
+                        return (buf, None);
+                    }
+                }
+            };
         }
     }
 }
-
-// impl<R> Stream for Reader<R>
-// where
-//     R: AsyncRead + std::marker::Unpin,
-// {
-//     type Item = Result<Vec<u8>>;
-
-//     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<Option<Self::Item>> {
-//         let this = std::pin::Pin::get_mut(self);
-//         let fut = this.read_record();
-//         let res = futures::ready!(fut.poll(cx));
-//         match res {
-//             Ok(record) => {
-//                 this.num_line += 1;
-//                 std::task::Poll::Ready(Some(Ok(record)))
-//             }
-//             Err(e) => std::task::Poll::Ready(Some(Err(e))),
-//         }
-//     }
-// }
 
 fn length_nl(b: &[u8]) -> usize {
     if b.len() > 0 && *b.last().unwrap() == b'\n' {
@@ -244,5 +318,8 @@ fn length_nl(b: &[u8]) -> usize {
 }
 
 fn is_eof(e: &Error) -> bool {
-    e.to_string() == "EOF"
+    match e.downcast_ref::<ErrorKind>() {
+        Some(ErrorKind::ErrEOF) => true,
+        _ => false,
+    }
 }
