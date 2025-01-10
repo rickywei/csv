@@ -46,18 +46,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_header() {
-        let data = "h1,h2,h3\na,b,c\n";
-        let mut rd = Reader::new(data.as_bytes())
-            .await
-            .unwrap()
-            .with_has_header(true)
-            .unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c"]]);
-    }
-
-    #[tokio::test]
     async fn test_simple() {
         let data = "a,b,c\n";
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
@@ -173,27 +161,88 @@ field""#;
             .with_lazy_quote(true)
             .unwrap();
         let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![
-            vec![r#"a "word""#],
-            vec![r#"1"2"#],
-            vec![r#"a""#]
-        ]);
+        assert_eq!(to_string_records(records), vec![vec![
+            r#"a "word""#,
+            r#"1"2"#,
+            r#"a""#,
+            "b"
+        ],]);
     }
 
     #[tokio::test]
-    async fn test_double_quote2() {
-        let data = r#"a""b,c"#;
-        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+    async fn test_bare_quote() {
+        let data = r#"a "word","1"2",a""#;
+        let mut rd = Reader::new(data.as_bytes())
+            .await
+            .unwrap()
+            .with_lazy_quote(true)
+            .unwrap();
         let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec![r#"a""b"#, "c"]]);
+        assert_eq!(to_string_records(records), vec![vec![
+            r#"a "word""#,
+            r#"1"2"#,
+            r#"a""#
+        ],]);
     }
 
     #[tokio::test]
-    async fn test_double_quote3() {
+    async fn test_bare_double_quote() {
+        let data = r#"a""b,c"#;
+        let mut rd = Reader::new(data.as_bytes())
+            .await
+            .unwrap()
+            .with_lazy_quote(true)
+            .unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec![r#"a""b"#, "c"],]);
+    }
+
+    #[tokio::test]
+    async fn test_bad_double_quote() {
         let data = r#"a""b,c"#;
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec![r#"a""b"#, "c"]]);
+        let records = rd.records().await;
+        assert_eq!(records.is_err(), true);
+        assert_eq!(
+            *records.err().unwrap().downcast_ref::<ErrorKind>().unwrap(),
+            ErrorKind::ErrQuote(1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bad_bare_quote() {
+        let data = r#"a "word","b""#;
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await;
+        assert_eq!(records.is_err(), true);
+        assert_eq!(
+            *records.err().unwrap().downcast_ref::<ErrorKind>().unwrap(),
+            ErrorKind::ErrQuote(1, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bad_trailing_quote() {
+        let data = r#""a word",b""#;
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await;
+        assert_eq!(records.is_err(), true);
+        assert_eq!(
+            *records.err().unwrap().downcast_ref::<ErrorKind>().unwrap(),
+            ErrorKind::ErrQuote(1, 11)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extraneous_quote() {
+        let data = r#""a "word","b""#;
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await;
+        assert_eq!(records.is_err(), true);
+        assert_eq!(
+            *records.err().unwrap().downcast_ref::<ErrorKind>().unwrap(),
+            ErrorKind::ErrQuote(1, 4)
+        );
     }
 
     #[tokio::test]
@@ -253,6 +302,22 @@ field""#;
     }
 
     #[tokio::test]
+    async fn test_trailing_comma_space_eof() {
+        let data = "a,b,c, ";
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c", " "]]);
+    }
+
+    #[tokio::test]
+    async fn test_trailing_comma_space_eol() {
+        let data = "a,b,c, \n";
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c", " "]]);
+    }
+
+    #[tokio::test]
     async fn test_trailing_comma_line3() {
         let data = "a,b,c\nd,e,f\ng,hi,";
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
@@ -262,14 +327,6 @@ field""#;
             vec!["d", "e", "f"],
             vec!["g", "hi", ""]
         ]);
-    }
-
-    #[tokio::test]
-    async fn test_trailing_comma() {
-        let data = "a,b,c, \n";
-        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c", " "],]);
     }
 
     #[tokio::test]
@@ -302,7 +359,7 @@ x,,,
     }
 
     #[tokio::test]
-    async fn test_trailing_comma_ineffective() {
+    async fn test_trailing_comma() {
         let data = "a,b,\nc,d,e";
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
         let records = rd.records().await.unwrap();
@@ -345,41 +402,6 @@ x,,,
             "Hello\nHi",
             "B"
         ]]);
-    }
-
-    #[tokio::test]
-    async fn test_utf8() {
-        let data = "你好，,こんにちは";
-        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records(records), vec![vec![
-            "你好，",
-            "こんにちは"
-        ]]);
-    }
-
-    #[tokio::test]
-    async fn test_gbk() {
-        let data = "你好，,こんにちは";
-        let (data, _, _) = GBK.encode(data);
-        let mut rd = Reader::new(&data[..]).await.unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records_gbk(records), vec![vec![
-            "你好，",
-            "こんにちは"
-        ]]);
-    }
-
-    #[tokio::test]
-    async fn test_gbk2() {
-        let data = "你\r好，,こんにちは\n\"世\n界\",\"再见\r\n\"";
-        let (data, _, _) = GBK.encode(data);
-        let mut rd = Reader::new(&data[..]).await.unwrap();
-        let records = rd.records().await.unwrap();
-        assert_eq!(to_string_records_gbk(records), vec![
-            vec!["你\r好，", "こんにちは"],
-            vec!["世\n界", "再见\n"]
-        ]);
     }
 
     #[tokio::test]
@@ -499,6 +521,18 @@ x,,,
     }
 
     #[tokio::test]
+    async fn test_lazy_quote_with_trailing_crlf() {
+        let data = "\"foo\"\"bar\"\r\n";
+        let mut rd = Reader::new(data.as_bytes())
+            .await
+            .unwrap()
+            .with_lazy_quote(true)
+            .unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["foo\"bar"],]);
+    }
+
+    #[tokio::test]
     async fn test_double_quote_with_trailing_crlf() {
         let data = "\"foo\"\"bar\"\r\n";
         let mut rd = Reader::new(data.as_bytes()).await.unwrap();
@@ -566,5 +600,52 @@ x,,,
             *rd.err().unwrap().downcast_ref::<ErrorKind>().unwrap(),
             ErrorKind::ErrInvalidDelim
         );
+    }
+
+    #[tokio::test]
+    async fn test_header() {
+        let data = "h1,h2,h3\na,b,c\n";
+        let mut rd = Reader::new(data.as_bytes())
+            .await
+            .unwrap()
+            .with_has_header(true)
+            .unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec!["a", "b", "c"]]);
+    }
+
+    #[tokio::test]
+    async fn test_utf8() {
+        let data = "你好，,こんにちは";
+        let mut rd = Reader::new(data.as_bytes()).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records(records), vec![vec![
+            "你好，",
+            "こんにちは"
+        ]]);
+    }
+
+    #[tokio::test]
+    async fn test_gbk() {
+        let data = "你好，,こんにちは";
+        let (data, _, _) = GBK.encode(data);
+        let mut rd = Reader::new(&data[..]).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records_gbk(records), vec![vec![
+            "你好，",
+            "こんにちは"
+        ]]);
+    }
+
+    #[tokio::test]
+    async fn test_gbk2() {
+        let data = "你\r好，,こんにちは\n\"世\n界\",\"再见\r\n\"";
+        let (data, _, _) = GBK.encode(data);
+        let mut rd = Reader::new(&data[..]).await.unwrap();
+        let records = rd.records().await.unwrap();
+        assert_eq!(to_string_records_gbk(records), vec![
+            vec!["你\r好，", "こんにちは"],
+            vec!["世\n界", "再见\n"]
+        ]);
     }
 }

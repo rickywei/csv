@@ -45,6 +45,17 @@ struct Position {
     col: usize,
 }
 
+#[derive(Default)]
+struct Slice {
+    line: Vec<u8>,
+    is_eof: bool,
+}
+
+struct Record {
+    fields: Vec<Vec<u8>>,
+    is_eof: bool,
+}
+
 pub struct Reader<R: AsyncRead + std::marker::Unpin> {
     r: BufReader<R>,
     comma: u8,
@@ -103,52 +114,44 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
 
     pub async fn records(&mut self) -> Result<Vec<Vec<Vec<u8>>>> {
         let mut records = Vec::new();
-        let mut record_buf = Vec::new();
         loop {
-            let record = self.read_record(&mut record_buf).await;
-            match record {
-                Ok(record) => {
-                    if self.remain_header {
-                        self.remain_header = false;
-                        continue;
-                    }
-                    records.push(record.iter().map(|f| f.to_vec()).collect());
+            let record = self.read_record().await?;
+            if record.is_eof {
+                break;
+            } else {
+                if self.remain_header {
+                    self.remain_header = false;
+                    continue;
                 }
-                Err(e) => {
-                    if is_eof(&e) {
-                        break;
-                    } else {
-                        return Err(e);
-                    }
-                }
+                records.push(record.fields);
             }
         }
         Ok(records)
     }
 
-    async fn read_record<'a>(&mut self, record_buf: &'a mut Vec<u8>) -> Result<Vec<&'a [u8]>> {
-        record_buf.clear();
+    async fn read_record<'a>(&mut self) -> Result<Record> {
+        let mut record_buf = Vec::new();
         let mut field_index = Vec::new();
         let mut field_position = Vec::new();
-        let mut line_vec = Vec::new();
-        let mut err = None;
+        let mut s = Slice::default();
         // skip empty line
-        while err.is_none() {
-            let res = self.read_line(&mut line_vec).await;
-            err = res.err();
-            if err.is_none() && line_vec.len() == length_nl(&line_vec) {
-                line_vec.clear();
+        while !s.is_eof {
+            s = self.read_line().await?;
+            if s.line.len() == length_nl(&s.line) {
+                s.line.clear();
                 continue;
             }
             break;
         }
-        if let Some(e) = err {
-            if is_eof(&e) {
-                return Err(e);
-            }
+        if s.is_eof {
+            return Ok(Record {
+                fields: Vec::new(),
+                is_eof: true,
+            });
         }
 
-        let mut line = line_vec.as_slice();
+        let Slice { line, is_eof } = s;
+        let mut line = line.as_slice();
         let mut pos = Position {
             line: self.num_line,
             col: 1,
@@ -220,23 +223,21 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
                             );
                         }
                     } else if line.len() > 0 {
-                        // Hit end of line
+                        // Hit end of line (copy all data so far)
                         record_buf.extend_from_slice(line);
                         pos.col += line.len();
-                        line_vec.clear();
-                        if let Err(e) = self.read_line(&mut line_vec).await {
-                            if !is_eof(&e) {
-                                return Err(e);
-                            }
-                        };
-                        line = line_vec.as_slice();
+                        s = self.read_line().await?;
+                        line = s.line.as_slice();
                         if line.len() > 0 {
                             pos.line += 1;
                             pos.col = 1;
                         }
+                        if s.is_eof {
+                            s.is_eof = false;
+                        }
                     } else {
                         if !self.lazy_quote {
-                            return Err(ErrorKind::ErrQuote(self.num_line, pos.col).into());
+                            return Err(ErrorKind::ErrQuote(pos.line, pos.col).into());
                         }
                         field_index.push(record_buf.len());
                         field_position.push(field_pos);
@@ -260,48 +261,54 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
             .into());
         }
 
-        let mut ret = Vec::new();
+        let mut record = Record {
+            fields: Vec::new(),
+            is_eof: is_eof,
+        };
         let mut pre_idx = 0;
         for idx in field_index {
-            ret.push(&record_buf[pre_idx..idx]);
+            record.fields.push(record_buf[pre_idx..idx].to_vec());
             pre_idx = idx;
         }
 
-        Ok(ret)
+        Ok(record)
     }
 
-    async fn read_line(&mut self) -> Result<()> {
-        let (mut line, mut err) = self.read_slice().await;
-        let n = line.len();
-        if let Some(e) = err {
-            if n > 0 && is_eof(&e) {
-                err = None;
-                if line[n - 1] == b'\r' {
-                    line = line[..n - 1].to_vec();
-                }
+    async fn read_line(&mut self) -> Result<Slice> {
+        let Slice {
+            mut line,
+            mut is_eof,
+        } = self.read_slice().await?;
+        let mut n = line.len();
+        if n > 0 && is_eof {
+            is_eof = false;
+            if line[n - 1] == b'\r' {
+                line.pop();
+                n -= 1;
             }
         }
         self.num_line += 1;
         self.offset += n;
         if n >= 2 && line[n - 2] == b'\r' && line[n - 1] == b'\n' {
             line[n - 2] = b'\n';
-            line.truncate(n - 1);
+            line.pop();
         }
-        Ok(())
+        Ok(Slice { line, is_eof })
     }
 
-    async fn read_slice(&mut self) -> (Vec<u8>, Option<Error>) {
-        let mut buf = Vec::new();
+    async fn read_slice(&mut self) -> Result<Slice> {
+        let mut s = Slice::default();
         loop {
-            let n = self.r.read_until(b'\n', &mut buf).await;
+            let n = self.r.read_until(b'\n', &mut s.line).await;
             match n {
-                Err(e) => return (buf, Some(e.into())),
+                Err(e) => return Err(e.into()),
                 Ok(0) => {
-                    return (buf, Some(ErrorKind::ErrEOF.into()));
+                    s.is_eof = true;
+                    return Ok(s);
                 }
                 Ok(_) => {
-                    if buf.last().unwrap() == &b'\n' {
-                        return (buf, None);
+                    if *s.line.last().unwrap() == b'\n' {
+                        return Ok(s);
                     }
                 }
             };
