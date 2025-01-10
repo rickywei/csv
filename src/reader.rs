@@ -1,43 +1,13 @@
 use anyhow::{Error, Result};
+use encoding_rs::Encoding;
 use memchr::memchr;
-use std::fmt::{Debug, Display};
+use std::str::from_utf8;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+
+use crate::err::*;
 
 const COMMA_LEN: usize = 1;
 const QUOTE_LEN: usize = 1;
-
-#[derive(Debug, PartialEq)]
-pub enum ErrorKind {
-    ErrInvalidDelim,
-    ErrEOF,
-    ErrQuote(usize, usize),
-    ErrChar(usize, usize, u8),
-    ErrFieldNum(usize, usize, usize, usize),
-}
-
-impl Display for ErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErrorKind::ErrInvalidDelim => write!(f, "Invalid Delimiter"),
-            ErrorKind::ErrEOF => write!(f, "EOF"),
-            ErrorKind::ErrQuote(line, col) => {
-                write!(f, "line:{} col:{} Error Quote", line, col)
-            }
-            ErrorKind::ErrChar(line, col, ch) => {
-                write!(f, "line:{} col:{} Unexpected Character {}", line, col, ch)
-            }
-            ErrorKind::ErrFieldNum(line, col, expect, got) => {
-                write!(
-                    f,
-                    "line:{} col:{} Wrong Number Of Fields, Expect:{} Got:{}",
-                    line, col, expect, got
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ErrorKind {}
 
 #[derive(Clone)]
 struct Position {
@@ -62,6 +32,7 @@ pub struct Reader<R: AsyncRead + std::marker::Unpin> {
     allow_diff_field_num: bool,
     has_header: bool,
     lazy_quote: bool,
+    encoding: Option<&'static Encoding>,
 
     num_line: usize,
     offset: usize,
@@ -70,23 +41,23 @@ pub struct Reader<R: AsyncRead + std::marker::Unpin> {
 }
 
 impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
-    pub async fn new(r: R) -> Result<Self> {
-        Ok(Self {
+    pub fn new(r: R) -> Self {
+        Self {
             r: BufReader::new(r),
             comma: b',',
             allow_diff_field_num: false,
             has_header: false,
             lazy_quote: false,
+            encoding: None,
 
             num_line: 0,
             offset: 0,
             field_per_record: 0,
             remain_header: false,
-        })
+        }
     }
 
-    pub fn with_delimiter(mut self, comma: u8) -> Result<Self> {
-        // TODO: check invalid delimiter
+    pub fn with_comma(mut self, comma: u8) -> Result<Self> {
         match comma {
             b'\n' | b'\r' | b'"' => Err(ErrorKind::ErrInvalidDelim.into()),
             _ => {
@@ -96,23 +67,47 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         }
     }
 
-    pub fn with_allow_diff_field_num(mut self, allow_diff_field_num: bool) -> Result<Self> {
+    pub fn with_allow_diff_field_num(mut self, allow_diff_field_num: bool) -> Self {
         self.allow_diff_field_num = allow_diff_field_num;
-        Ok(self)
+        self
     }
 
-    pub fn with_has_header(mut self, has_header: bool) -> Result<Self> {
+    pub fn with_has_header(mut self, has_header: bool) -> Self {
         self.has_header = has_header;
         self.remain_header = has_header;
-        Ok(self)
+        self
     }
 
-    pub fn with_lazy_quote(mut self, lazy_quote: bool) -> Result<Self> {
+    pub fn with_lazy_quote(mut self, lazy_quote: bool) -> Self {
         self.lazy_quote = lazy_quote;
-        Ok(self)
+        self
     }
 
-    pub async fn records(&mut self) -> Result<Vec<Vec<Vec<u8>>>> {
+    pub fn with_encoding(mut self, encoding: &'static Encoding) -> Self {
+        self.encoding = Some(encoding);
+        self
+    }
+
+    pub async fn string_records(&mut self) -> Result<Vec<Vec<String>>> {
+        let records = self.bytes_records().await?;
+        let mut ret = Vec::new();
+        let is_none = self.encoding.is_none();
+        let encoding = self.encoding.unwrap_or(encoding_rs::UTF_8);
+        for record in records {
+            let mut fields = Vec::new();
+            for f in record {
+                fields.push(if is_none {
+                    to_utf8(&f)?
+                } else {
+                    to_encoding(&f, encoding)?
+                });
+            }
+            ret.push(fields);
+        }
+        Ok(ret)
+    }
+
+    pub async fn bytes_records(&mut self) -> Result<Vec<Vec<Vec<u8>>>> {
         let mut records = Vec::new();
         loop {
             let record = self.read_record().await?;
@@ -324,9 +319,11 @@ fn length_nl(b: &[u8]) -> usize {
     }
 }
 
-fn is_eof(e: &Error) -> bool {
-    match e.downcast_ref::<ErrorKind>() {
-        Some(ErrorKind::ErrEOF) => true,
-        _ => false,
-    }
+fn to_utf8(bytes: &[u8]) -> Result<String> {
+    Ok(from_utf8(bytes)?.to_string())
+}
+
+fn to_encoding(bytes: &[u8], encoding: &'static Encoding) -> Result<String> {
+    let (str, _, _) = encoding.decode(bytes);
+    Ok(str.to_string())
 }
