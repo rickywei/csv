@@ -335,3 +335,4 @@ mod writer_test {
         assert_eq!(out, expect.to_vec());
     }
 }
+
