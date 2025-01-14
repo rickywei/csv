@@ -1,10 +1,9 @@
-use anyhow::{Error, Result};
+use crate::err::*;
+use anyhow::Result;
 use encoding_rs::Encoding;
 use memchr::memchr;
 use std::str::from_utf8;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-
-use crate::err::*;
 
 const COMMA_LEN: usize = 1;
 const QUOTE_LEN: usize = 1;

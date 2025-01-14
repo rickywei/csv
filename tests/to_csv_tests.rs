@@ -35,17 +35,18 @@ mod to_csv_macro_test {
     }
 
     // #[test]
-    // fn test_header2() {
+    // fn test_header3() {
+    //     #[derive(ToCSVMacro)]
     //     struct Symbol {
     //         security_id: String,
     //         exchange: String,
-    //     };
+    //     }
 
     //     #[derive(ToCSVMacro)]
     //     struct Tick {
     //         symbol: Symbol,
     //         price: f64,
-    //     };
+    //     }
 
     //     let tk = Tick {
     //         symbol: Symbol {
