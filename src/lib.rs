@@ -3,7 +3,7 @@ pub mod reader;
 pub mod writer;
 
 pub trait FromCSV {
-    fn from_header_record(header: &Vec<&str>, record: &Vec<&str>) -> Self;
+    fn from_record(header: &Vec<&str>, record: &Vec<&str>) -> Self;
 }
 
 pub trait ToCSV {

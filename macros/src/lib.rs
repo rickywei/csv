@@ -1,8 +1,6 @@
-use std::any::Any;
-
 use proc_macro::TokenStream;
-use quote::{ToTokens, quote};
-use syn::{self, Expr, ExprAssign, GenericParam, parse_quote};
+use quote::quote;
+use syn::{self, Expr, GenericParam, parse_quote};
 use syn::{DataEnum, DataUnion, DeriveInput};
 
 #[proc_macro_derive(ToCSVMacro, attributes(csv))]
@@ -29,7 +27,7 @@ fn impl_to_csv(ast: &DeriveInput) -> TokenStream {
     let mut header = quote! {
         let mut inner = Vec::new();
     };
-    let mut record = quote! {
+    let record = quote! {
         let mut inner = Vec::new();
     };
     match data {
@@ -37,29 +35,34 @@ fn impl_to_csv(ast: &DeriveInput) -> TokenStream {
             for field in s.fields.iter() {
                 if field.ident.is_none() {
                 } else {
-                    let mut csv_field_name = None;
+                    let field_ident = field.ident.as_ref().unwrap().to_string();
                     for attr in &field.attrs {
                         if attr.path().is_ident("csv") {
                             match attr.parse_args() {
                                 Err(_) => {}
                                 Ok(attr) => match attr {
                                     Expr::Assign(expr) => {
-                                        csv_field_name = Some(expr.right);
+                                        if let Expr::Path(path) = *expr.left {
+                                            if path.path.is_ident("field") {
+                                                let right = expr.right;
+                                                header.extend(quote! {
+                                                    inner.push(#right.to_string());
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Expr::Path(expr) => {
+                                        if expr.path.is_ident("flatten") {
+                                            header.extend(quote! {
+                                                let tmp = self.#field_ident.to_header();
+                                                inner.extend(tmp);
+                                            });
+                                        }
                                     }
                                     _ => {}
                                 },
                             }
                         }
-                    }
-                    if let Some(field_name) = csv_field_name {
-                        header.extend(quote! {
-                            inner.push(#field_name.to_string());
-                        });
-
-                        let field_ident = field.ident.as_ref().unwrap();
-                        record.extend(quote! {
-                            inner.push(format!("{}", self.#field_ident));
-                        });
                     }
                 }
             }
