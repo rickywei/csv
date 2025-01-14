@@ -35,7 +35,6 @@ fn impl_to_csv(ast: &DeriveInput) -> TokenStream {
             for field in s.fields.iter() {
                 if field.ident.is_none() {
                 } else {
-                    let field_ident = field.ident.as_ref().unwrap().to_string();
                     for attr in &field.attrs {
                         if attr.path().is_ident("csv") {
                             match attr.parse_args() {
@@ -53,6 +52,7 @@ fn impl_to_csv(ast: &DeriveInput) -> TokenStream {
                                     }
                                     Expr::Path(expr) => {
                                         if expr.path.is_ident("flatten") {
+                                            let field_ident = field.ident.as_ref().unwrap();
                                             header.extend(quote! {
                                                 let tmp = self.#field_ident.to_header();
                                                 inner.extend(tmp);
