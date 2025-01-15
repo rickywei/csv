@@ -503,7 +503,7 @@ x,,,
     #[tokio::test]
     async fn test_header() {
         let data = "h1,h2,h3\na,b,c\n";
-        let mut rd = Reader::new(data.as_bytes()).with_has_header(true);
+        let mut rd = Reader::new(data.as_bytes()).with_skip_header(true);
         let records = rd.string_records().await.unwrap();
         assert_eq!(records, vec![vec!["a", "b", "c"]]);
     }

@@ -1,12 +1,15 @@
-use crate::err::*;
+use std::fmt::Display;
+
+use crate::{HeaderCSV, ToCSV, err::*};
 use anyhow::Result;
 use encoding_rs::Encoding;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 
-
 pub struct Writer<R> {
     w: BufWriter<R>,
     comma: u8,
+    write_header: bool,
+    custom_header: Option<Vec<String>>,
     use_crlf: bool,
     encoding: Option<&'static Encoding>,
 }
@@ -16,6 +19,8 @@ impl<R: AsyncWrite + std::marker::Unpin> Writer<R> {
         Writer {
             w: BufWriter::new(w),
             comma: b',',
+            write_header: false,
+            custom_header: None,
             use_crlf: false,
             encoding: None,
         }
@@ -31,6 +36,16 @@ impl<R: AsyncWrite + std::marker::Unpin> Writer<R> {
         }
     }
 
+    pub fn with_write_header(mut self, write_header: bool) -> Self {
+        self.write_header = write_header;
+        self
+    }
+
+    pub fn with_custom_header(mut self, custom_header: Vec<String>) -> Self {
+        self.custom_header = Some(custom_header);
+        self
+    }
+
     pub fn with_use_crlf(mut self, use_crlf: bool) -> Self {
         self.use_crlf = use_crlf;
         self
@@ -41,24 +56,38 @@ impl<R: AsyncWrite + std::marker::Unpin> Writer<R> {
         self
     }
 
-    pub async fn write_records(
-        &mut self,
-        header: Option<Vec<&str>>,
-        records: Vec<Vec<&str>>,
-    ) -> Result<()> where {
-        if let Some(hd) = header {
-            let _ = self.write_record(hd).await?;
+    pub async fn serialize<T>(&mut self, records: &Vec<T>) -> Result<()>
+    where
+        T: HeaderCSV + ToCSV,
+    {
+        if self.write_header && self.custom_header.is_none() {
+            self.custom_header = Some(T::get_header());
+        }
+        self.write_records(records.iter().map(|v| v.to_csv()).collect())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn write_records<T>(&mut self, records: Vec<Vec<T>>) -> Result<()>
+    where
+        T: Display,
+    {
+        if self.write_header && self.custom_header.is_some() {
+            self.write_record(self.custom_header.clone().unwrap())
+                .await?;
         }
         for record in records {
-            let _ = self.write_record(record).await?;
+            let _ = self
+                .write_record(record.iter().map(|f| f.to_string()).collect())
+                .await?;
         }
         let _ = self.w.flush().await?;
         Ok(())
     }
 
-    async fn write_record(&mut self, line: Vec<&str>) -> Result<()> {
+    async fn write_record(&mut self, record: Vec<String>) -> Result<()> {
         let comma = &[self.comma];
-        for (n, field) in line.iter().enumerate() {
+        for (n, field) in record.iter().enumerate() {
             let encoded_field;
             let mut field = match self.encoding {
                 None => field.as_bytes(),
@@ -119,9 +148,6 @@ impl<R: AsyncWrite + std::marker::Unpin> Writer<R> {
     }
 
     fn field_needs_quotes(&self, field: &[u8]) -> bool {
-        if field.len() == 0 {
-            return false;
-        }
         for &b in field {
             if b == b'\n' || b == b'\r' || b == b'"' || b == self.comma {
                 return true;

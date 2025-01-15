@@ -1,4 +1,4 @@
-use crate::err::*;
+use crate::{FromCSV, HeaderCSV, err::*};
 use anyhow::Result;
 use encoding_rs::Encoding;
 use memchr::memchr;
@@ -28,15 +28,16 @@ struct Record {
 pub struct Reader<R: AsyncRead + std::marker::Unpin> {
     r: BufReader<R>,
     comma: u8,
+    skip_header: bool,
+    custom_header: Option<Vec<String>>,
     allow_diff_field_num: bool,
-    has_header: bool,
     lazy_quote: bool,
     encoding: Option<&'static Encoding>,
 
     num_line: usize,
     offset: usize,
     field_per_record: usize,
-    remain_header: bool,
+    still_skip_header: bool,
 }
 
 impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
@@ -44,15 +45,16 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         Self {
             r: BufReader::new(r),
             comma: b',',
+            skip_header: false,
+            custom_header: None,
             allow_diff_field_num: false,
-            has_header: false,
             lazy_quote: false,
             encoding: None,
 
             num_line: 0,
             offset: 0,
             field_per_record: 0,
-            remain_header: false,
+            still_skip_header: false,
         }
     }
 
@@ -66,14 +68,19 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
         }
     }
 
-    pub fn with_allow_diff_field_num(mut self, allow_diff_field_num: bool) -> Self {
-        self.allow_diff_field_num = allow_diff_field_num;
+    pub fn with_skip_header(mut self, skip_header: bool) -> Self {
+        self.skip_header = skip_header;
+        self.still_skip_header = skip_header;
         self
     }
 
-    pub fn with_has_header(mut self, has_header: bool) -> Self {
-        self.has_header = has_header;
-        self.remain_header = has_header;
+    pub fn with_custom_header(mut self, custom_header: Vec<String>) -> Self {
+        self.custom_header = Some(custom_header.clone());
+        self
+    }
+
+    pub fn with_allow_diff_field_num(mut self, allow_diff_field_num: bool) -> Self {
+        self.allow_diff_field_num = allow_diff_field_num;
         self
     }
 
@@ -85,6 +92,24 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
     pub fn with_encoding(mut self, encoding: &'static Encoding) -> Self {
         self.encoding = Some(encoding);
         self
+    }
+
+    pub async fn deserialize<T>(&mut self) -> Result<Vec<T>>
+    where
+        T: HeaderCSV + FromCSV,
+    {
+        let string_records = self.string_records().await?;
+        let mut ret = Vec::new();
+        for record in string_records {
+            ret.push(T::from_csv(
+                self.custom_header
+                    .as_ref()
+                    .unwrap_or(T::get_header().as_ref())
+                    .as_ref(),
+                &record,
+            )?);
+        }
+        Ok(ret)
     }
 
     pub async fn string_records(&mut self) -> Result<Vec<Vec<String>>> {
@@ -112,11 +137,9 @@ impl<R: AsyncRead + std::marker::Unpin> Reader<R> {
             let record = self.read_record().await?;
             if record.is_eof {
                 break;
+            } else if self.still_skip_header {
+                self.still_skip_header = false;
             } else {
-                if self.remain_header {
-                    self.remain_header = false;
-                    continue;
-                }
                 records.push(record.fields);
             }
         }

@@ -7,6 +7,7 @@ pub enum ErrorKind {
     ErrQuote(usize, usize),
     ErrChar(usize, usize, u8),
     ErrFieldNum(usize, usize, usize, usize),
+    ErrMissField(String),
 }
 
 impl Display for ErrorKind {
@@ -26,6 +27,9 @@ impl Display for ErrorKind {
                     "line:{} col:{} Wrong Number Of Fields, Expect:{} Got:{}",
                     line, col, expect, got
                 )
+            }
+            ErrorKind::ErrMissField(field) => {
+                write!(f, "missing field {}", field)
             }
         }
     }
